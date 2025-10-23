@@ -1,0 +1,285 @@
+---
+title: "bureau-de-vote"
+author: "valentin"
+date: "2025-10-23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+library(here)
+library(tidyverse)
+library(sf)
+library(readxl)
+library(xlsx)
+library(jsonlite)
+library(stringr)
+library(DescTools)
+library(rnaturalearth)
+library(ggpubr)
+library(units)
+library(scales)
+library(kableExtra)
+
+# devtools::install_github("InseeFrLab/mapvotr")
+library(mapvotr)
+
+library(leaflet)
+library(htmlwidgets)
+library(htmltools)  # for HTML rendering in labels
+library(RColorBrewer)
+
+```
+
+Objectif : Connaître le taux d'abstention par aire géographique des bureaux de vote à Marseille. 
+Plan d'action : 
+- Importer les données du taux d'abstention par BV
+- Importer les données des aires géographiques par BV
+- Restreindre les données aux BV de Marseille
+- Joindre les données par un identifiant BV, en s'assurant qu'il est cohérent entre les deux bases. 
+
+
+```{r}
+
+# Résultats électoraux, y compris abstention, par BV 
+# Source : https://www.data.gouv.fr/datasets/municipales-2020-resultats-2nd-tour/
+res_bv = read_xlsx(here("input_data", "resultats-par-niveau-burvot-t2-france-entiere.xlsx"))
+
+# Tous les BV et leur adresse
+# Source : https://www.data.gouv.fr/datasets/bureaux-de-vote-et-adresses-de-leurs-electeurs/
+bv_reu = read.csv(here("input_data", "table-bv-reu.csv"))
+
+# Toutes les adresses - hyper lourd (16M de lignes)
+# ad_reu = read.csv(here("input_data", "table-adresses-reu.csv"))
+# maiz = ad_reu %>% filter(grepl("37 rue Smith", geo_adresse))
+# arr = ad_reu %>% filter(code_commune_ref == 69002) # bizarre
+
+# Aires géographiques "contours" estimées par l'INSEE pour chaque BV
+# Source : https://www.data.gouv.fr/datasets/proposition-de-contours-des-bureaux-de-vote/
+contours = read_sf((here("input_data", "contours-france-entiere-latest-v2.geojson")))
+
+# Secteurs des bureaux de vote à *Paris* 
+# download.file(
+#   "https://www.data.gouv.fr/datasets/secteurs-des-bureaux-de-vote-2025/#/resources/acc452ca-05df-483a-993b-bf9154112031", 
+#   destfile = here("input_data", "secteurs-des-bureaux-de-vote-2025.csv"),
+#   mode = "wb")
+# sect_bv = jsonlite::fromJSON(here("input_data", "secteurs-des-bureaux-de-vote-2025.json"))
+# sect_bv = read_json(here("input_data", "secteurs-des-bureaux-de-vote-2025.json"),
+#                     simplifyVector = TRUE)
+# sect_bv = read_csv(here("input_data", "secteurs-des-bureaux-de-vote-2025.csv"))
+# glimpse(sect_bv)
+# sect_bv_flt = sect_bv %>% mutate(across(where(is.data.frame), as.character))
+# sf_bv = read_sf((here("input_data", "secteurs-des-bureaux-de-vote-2025.geojson")))
+# sect_bv %>% st_as_sf(sect_bv, sf_column_name = sect_bv$geo_shape$geometry)
+
+```
+
+
+```{r}
+# A bit of tidying
+# names(res_bv)
+res_bv = 
+  res_bv %>% 
+  rename(nomCommune = `Libellé de la commune`,
+         codeBV_inCommune = `Code B.Vote`,
+         pct_Abs_in_Ins = `% Abs/Ins`, 
+         pct_Vot_in_Ins = `% Vot/Ins`, 
+         pct_Blancs_in_Ins = `% Blancs/Ins`, 
+         pct_Blancs_in_Vot = `% Blancs/Vot`, 
+         pct_Exp_in_Ins = `% Exp/Ins`, 
+         pct_Exp_in_Vot = `% Exp/Vot`
+         ) %>% 
+  mutate(idBV_miomFormat = paste0(`Code du département`, `Code de la commune`, "_", codeBV_inCommune))
+
+# Contours
+names(contours)
+
+# BV addresses
+bv_reu = 
+  bv_reu %>% 
+  rowwise %>% 
+  mutate(adresseBV = paste(libelle_reu, num_voie_reu, voie_reu, cp_reu, 
+                            sep = " ")) %>% 
+  ungroup() %>% 
+  mutate(codeBV_inCommune = sub("^[^_]*_", "", id_brut_miom))
+
+```
+
+
+```{r}
+# Restrict to Marseille 
+res_bv_mrs = res_bv %>% filter(nomCommune == "Marseille") # 
+# glimpse(res_bv_mrs)
+
+unique_BV_res_bv_mrs = res_bv_mrs$idBV_miomFormat %>% unique() %>% length() # 480
+stopifnot(unique_BV_res_bv_mrs == nrow(res_bv_mrs))
+
+contours_mrs = contours %>% filter(nomCommune == "Marseille") # 476 BV
+glimpse(contours_mrs)
+
+unique_BV_contours_mrs = contours_mrs$numeroBureauVote %>% unique() %>% length()
+unique_BV_contours_mrs
+contours_mrs$codeBureauVote %>% unique() %>% length()
+contours_mrs$id_bv %>% unique() %>% length()
+
+
+bv_reu_mrs = bv_reu %>% filter(commune_reu == "marseille")
+bv_reu_mrs$id_brut_reu %>% unique() %>% length()
+bv_reu_mrs$id_brut_insee %>% unique() %>% length() # this is the id from INSEE, the entity providing the shapefile. 
+bv_reu_mrs$id_brut_miom %>% unique() %>% length() # this is the id from the ministère de l'intérieur et des outre-mers, the same entity as the one providing the election data. 
+
+
+```
+En restreignant à Marseille, il y a ```{r unique_BV_res_bv_mrs}``` bureaux de vote uniques avec des résultats d'élection. 
+
+Concernant les bureaux de vote avec une aire géographique estimée, il y a ```{r unique_BV_contours_mrs}``` identifiants uniques, pour chacun des 3 formats d'identifiants fournis.  
+
+Pour joindre les données de contours et de résultats électoraux, il faut s'assurer qu'on utilise une clé qui identifie les mêmes BV dans chaque base de données.
+Les résultats électoraux sont fournis par le MIOM, sans explication sur l'identifiant BV.
+Les contours sont fournis par l'INSEE, sans explication sur LES identifiants BV.
+Par contre, l'INSE fournit une table de correspondance entre différents identifiants BV, avec une documentation. 
+https://www.data.gouv.fr/datasets/bureaux-de-vote-et-adresses-de-leurs-electeurs/
+
+Cette documentation indique que la variable id_brut_miom est l'"identifiant unique dans le système d’information centralisant les résultats électoraux
+du ministère de l’Intérieur (SIE1) du bureau de vote associé à l’adresse" et est "Construit comme suit : code-commune-ref_code-miom-du-bv-dans-la-commune." (appelons le le format MIOM). 
+En utilisant cet identifiant comme clé, on peut donc déjà joindre avec confiance la table d'équivalence de l'INSEE avec la base des résultats électoraux du MIOM. 
+
+Ensuite, on se sert des équivalences pour ajouter les contours. 
+
+Grâce à la documentation de la table d'équivalence, on comprend que dans contours, il y a deux identifiants distincts: 
+- codeBureauVote au format codeDepartementcodeCommune_numeroBureauVote ("format MIOM")
+- id_bv qui concatenne un autre format de code département-commune et une version "nettoyée" du numéro de bureau de vote ("format REU / INSEE").
+
+Comme chacun de ces formats est présent dans table d'équivalence, on peut joindre une fois par chacun comme clé. Si on obtient le même résultat, on peut avoir confiance dans la jointure entre les résultats électoraux et contours.   
+
+Parmi les 3 formats d'identifiants fournis dans la base de données des contours, un seul a le même format que dans la base de donnée des résultats. 
+
+```{r}
+# Join election results to equivalence table
+res_eq = 
+  left_join(res_bv_mrs, 
+            bv_reu_mrs, 
+            by = join_by(idBV_miomFormat == id_brut_miom))
+
+# Join to contours, based on a priori MIOM format in both sides
+fin = 
+  left_join(contours_mrs, 
+            res_eq %>% select(idBV_miomFormat, contains("Abs") | contains("pct")), 
+            by = join_by(codeBureauVote == idBV_miomFormat))
+
+# Check that we get the same matches based on a merge in the other key
+test = 
+   left_join(contours_mrs, 
+            res_eq %>% select(contains("id_brut_") | contains("Abs") | contains("pct")), 
+            by = join_by(id_bv == id_brut_insee))
+
+stopifnot(all.equal(
+  test %>% mutate(testvar = as.numeric(numeroBureauVote)*Abstentions) %>% pull(testvar), 
+  fin  %>% mutate(testvar = as.numeric(numeroBureauVote)*Abstentions) %>% pull(testvar)
+))
+
+# ON EN EST LA 
+# Apparemment test prend des NAs d'Abstentions alors que fin n'en prend pas. Donc test ne match pas aussi bien. 
+test %>% filter(is.na(Abstentions))
+# Comprendre pourquoi, et éventuellement faire le test en retirant juste ces deux là de fin. 
+
+# (/!\ SI ON JOINT DES BASES COUVRANT PLUSIEURS COMMUNES IL FAUT PAS UTILISER JUSTE LE CODE BV AU SEIN DE LA COMMUNE COMME CLE)
+
+# check match quality 
+res_bv_mrs$codeBV %>% is.na() %>% sum()
+res_bv_mrs$Abstentions %>% class()
+res_bv_mrs$Abstentions %>% is.na() %>% sum()
+fin$Abstentions %>% is.na() %>% sum()
+stopifnot(sum(is.na(fin$Abstentions)) == sum(is.na(res_bv_mrs$Abstentions)))
+# It this passes, they all have a match 
+
+stopifnot(nrow(fin) == nrow(contours_mrs))
+# If this passes, they have a unique match
+```
+Tous les BVs avec un contours ont une correspondance unique avec un BV dont on connait les résultats. 
+
+
+Par ailleurs, on peut utiliser la "Table de correspondance expérimentale et ponctuelle des référentiels de bureaux
+de vote" proposée par l'Insee et l'Etalab. 
+(Voir Annexe B. du PDF "methodology" à ce lien : https://www.data.gouv.fr/datasets/bureaux-de-vote-et-adresses-de-leurs-electeurs/). 
+
+
+```{r}
+
+# Join BV addresses 
+fin = 
+  left_join(fin, 
+            bv_reu_mrs %>% select(codeBV_miom, adresseBV, nb_adresses_final, id_brut_reu, id_brut_insee, id_brut_miom), 
+            by = join_by(numeroBureauVote == codeBV_miom))
+
+bv_reu_mrs$nb_adresses_final %>% is.na() %>% sum()
+fin$nb_adresses_final %>% is.na() %>% sum()
+
+```
+
+
+
+
+# CARTE DE L'ABSTENTION PAR BUREAU DE VOTE A MARSEILLE  
+```{r}
+field_name = "pct_Abs_in_Ins"
+adresse_field <- "adresseBV"
+
+fin$val_formatted <- ifelse(
+  is.na(fin[[field_name]]),
+  NA_character_,
+  paste0(formatC(fin[[field_name]], format = "f", digits = 1, big.mark = " "),
+         " %")
+)
+# Create an HTML label column (one label per feature)
+fin$label_html <- paste0(
+  "<strong>Abstention : </strong>",
+  fin$val_formatted,
+  "<br/>",
+  "<strong>Adresse BV : </strong>",
+  # If adresseBV might be NA, handle it gracefully:
+  ifelse(is.na(fin[[adresse_field]]), "", fin[[adresse_field]])
+)
+
+# 3. Create a color palette based on that field
+pal <- colorNumeric(palette = "YlOrRd", domain = fin[[field_name]], na.color = "transparent")
+
+# 4. Build the leaflet map using the precomputed label column
+m <- leaflet(fin) %>%
+  addProviderTiles(providers$CartoDB.Positron) %>%
+  addPolygons(
+    fillColor = ~pal(get(field_name)), # get() here is fine because field_name is a single string
+    weight = 1,
+    opacity = 1,
+    color = "white",
+    dashArray = "3",
+    fillOpacity = 0.4,   # increased transparency
+    highlightOptions = highlightOptions(
+      weight = 2,
+      color = "#666",
+      fillOpacity = 0.6,
+      bringToFront = TRUE
+    ),
+    label = ~HTML(label_html),  # use pre-built HTML label column
+    labelOptions = labelOptions(
+      style = list("font-weight" = "normal", padding = "3px 8px"),
+      textsize = "13px",
+      direction = "auto"
+    )
+  ) %>%
+  addLegend(
+    pal = pal,
+    values = ~get(field_name),
+    opacity = 0.7,
+    title = "% d'abstention :",
+    position = "bottomright"
+  )
+
+# 5. Display the map in RStudio viewer
+m
+
+# 6. Save it as an interactive HTML file
+saveWidget(m, file = here("abstention_bv_marseille.html"), selfcontained = TRUE)
+
+```
+
